@@ -2,7 +2,7 @@
 CivilOS Structural — Compute Microservice
 ==========================================
 
-এই সার্ভিস Cloud Run-এ চলবে এবং ভারী স্ট্রাকচারাল ক্যালকুলেশনের জন্য দায়ী।
+এই সার্ভিস Railway-তে চলবে এবং ভারী স্ট্রাকচারাল ক্যালকুলেশনের জন্য দায়ী।
 Next.js ফ্রন্টএন্ড এই সার্ভিসে JSON payload পাঠায়, একটা job_id ফেরত পায়,
 এবং সেই job_id দিয়ে status/result poll করে।
 
@@ -34,7 +34,7 @@ app = FastAPI(
 
 # CORS: শুধু Vercel-এ deploy হওয়া Next.js app থেকে কল অ্যালাউ করা হবে।
 # Phase 0-তে dev-এর সুবিধার জন্য চওড়া রাখা হলো; production-এ এটা
-# নির্দিষ্ট origin-এ কমিয়ে আনা জরুরি (নিচে ENV var দিয়ে করা যায়)।
+# নির্দিষ্ট origin-এ কমিয়ে আনা জরুরি (Railway dashboard-এ ENV var দিয়ে করা যায়)।
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # TODO(Phase 0 hardening): নির্দিষ্ট Vercel domain বসাতে হবে
@@ -79,14 +79,14 @@ class JobStatusResponse(BaseModel):
 
 
 # Phase 0 এর জন্য in-memory store যথেষ্ট। Phase 4-এ এটা Firestore বা
-# Cloud Tasks/Pub-Sub ভিত্তিক প্রকৃত job queue-তে সরানো হবে, কারণ
-# Cloud Run instance রিস্টার্ট হলে in-memory ডেটা হারিয়ে যায়।
+# Redis/Celery ভিত্তিক প্রকৃত job queue-তে সরানো হবে, কারণ
+# Railway instance রিস্টার্ট হলে (redeploy/sleep) in-memory ডেটা হারিয়ে যায়।
 _job_store: dict[str, JobStatusResponse] = {}
 
 
 @app.get("/health")
 def health_check() -> dict[str, str]:
-    """Cloud Run readiness/liveness probe এর জন্য।"""
+    """Railway readiness/liveness probe এর জন্য।"""
     return {"status": "ok", "service": "civilos-structural-solver"}
 
 
@@ -97,9 +97,9 @@ def submit_analysis_job(request: AnalysisJobRequest) -> AnalysisJobResponse:
 
     Phase 0: শুধু validate করে, job_id দেয়, এবং সাথে সাথেই একটা
     placeholder "completed" স্ট্যাটাসে সেট করে দেয় (echo-back), যাতে
-    Next.js ↔ Cloud Run যোগাযোগ end-to-end টেস্ট করা যায়।
+    Next.js ↔ Railway যোগাযোগ end-to-end টেস্ট করা যায়।
 
-    Phase 4: এখানে আসল async job dispatch হবে (Cloud Tasks queue এ পাঠানো,
+    Phase 4: এখানে আসল async job dispatch হবে (Redis/Celery queue এ পাঠানো,
     worker যেটা C++ solver কল করবে)।
     """
     job_id = str(uuid.uuid4())

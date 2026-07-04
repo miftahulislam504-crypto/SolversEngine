@@ -1,5 +1,5 @@
 # CivilOS Structural — Compute Microservice
-# Cloud Run এর জন্য optimized: PORT env var respect করে, slim base image ব্যবহার করে।
+# Railway এর জন্য optimized: PORT env var respect করে, slim base image ব্যবহার করে।
 #
 # Phase 4-এ যখন C++ solver (Eigen/OpenBLAS) যোগ হবে, তখন এই Dockerfile-এ
 # একটা build stage যোগ করতে হবে যেটা C++ কম্পাইল করবে এবং binary টা
@@ -20,7 +20,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-# Cloud Run PORT env var দিয়ে পোর্ট বলে দেয়; ডিফল্ট 8080 রাখা হলো লোকাল টেস্টের জন্য।
+# Railway PORT env var দিয়ে পোর্ট বলে দেয়; ডিফল্ট 8080 রাখা হলো লোকাল টেস্টের জন্য।
 ENV PORT=8080
 EXPOSE 8080
 
