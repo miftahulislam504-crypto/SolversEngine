@@ -1,58 +1,26 @@
-name: Deploy Solver to Cloud Run
+name: Deploy Solver to Railway
 
-# main branch-এ push হলেই এটা চলবে এবং Cloud Run-এ নতুন revision deploy করবে।
+# main branch-এ push হলেই এটা চলবে এবং Railway-তে নতুন deployment ট্রিগার করবে।
 # এটা কাজ করার আগে GitHub repo Settings → Secrets and variables → Actions এ
-# নিচের secrets যোগ করতে হবে (README.md এ পুরো নির্দেশনা আছে):
-#   GCP_PROJECT_ID
-#   GCP_SA_KEY          (service account JSON key, base64 নয় — raw JSON)
-#   GCP_REGION          (e.g. asia-southeast1)
+# নিচের secret যোগ করতে হবে (README.md এ পুরো নির্দেশনা আছে):
+#   RAILWAY_TOKEN
 
 on:
   push:
     branches: [main]
 
-env:
-  SERVICE_NAME: civilos-structural-solver
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
 
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: ${{ secrets.GCP_PROJECT_ID }}
-
-      - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker ${{ secrets.GCP_REGION }}-docker.pkg.dev --quiet
-
-      - name: Build and push image
-        run: |
-          IMAGE="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/civilos/${{ env.SERVICE_NAME }}:${{ github.sha }}"
-          docker build -t "$IMAGE" .
-          docker push "$IMAGE"
-          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
-
-      - name: Deploy to Cloud Run
-        run: |
-          gcloud run deploy ${{ env.SERVICE_NAME }} \
-            --image "${{ env.IMAGE }}" \
-            --region "${{ secrets.GCP_REGION }}" \
-            --platform managed \
-            --allow-unauthenticated \
-            --memory 512Mi \
-            --cpu 1 \
-            --min-instances 0 \
-            --max-instances 5
+      - name: Deploy to Railway
+        run: railway up --service civilos-structural-solver --detach
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
