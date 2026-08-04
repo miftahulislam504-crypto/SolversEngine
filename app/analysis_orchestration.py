@@ -1,0 +1,525 @@
+"""
+Analysis Orchestration — Frontend Model → Solver Call
+=========================================================
+
+এই মডিউল frontend থেকে আসা পূর্ণাঙ্গ structural model (Firestore থেকে
+পড়া elements, materials, sections, loads — সবগুলো একসাথে) নিয়ে
+C++ solver এর জন্য প্রয়োজনীয় node graph বানায়, এবং ফলাফল আবার
+frontend-বোধগম্য shape এ ফেরত দেয়।
+
+গুরুত্বপূর্ণ সীমাবদ্ধতা (Phase 4a):
+  - শুধু Line Element (Beam, Column, Brace, Pile) সমর্থিত। Slab/Wall/
+    Shear Wall/Core Wall/Footing — এগুলো Area/Point element, যাদের FE
+    mesh discretization প্রয়োজন যা এখনো নেই (Master Plan এর FE Module,
+    Phase 4 এর পরের ধাপ)। এই মডিউল এমন element পেলে সেগুলো solve করার
+    চেষ্টা না করে explicit ভাবে skip করে এবং warning রিপোর্ট করে —
+    silent-drop না।
+  - "pin" connectionType (Brace) এখন প্রয়োগ করা হয় (static condensation,
+    cpp/src/stiffness.cpp এর applyEndReleases()), কিন্তু শুধু both-end
+    release হিসেবে — single-end release সমর্থিত না (বিস্তারিত নিচে
+    element assembly অংশে)।
+  - Uniform line/area load কে এখনো equivalent nodal load এ রূপান্তর
+    করা হয় না (এটা নিজেই একটা নির্ভুল সূত্র দাবি করে — fixed-end
+    moment/shear থেকে আসা equivalent load, যা একটা future ধাপ)। এই
+    মুহূর্তে শুধু Point Load সরাসরি ব্যবহারযোগ্য।
+  - Mid-span Point Load এখন সঠিকভাবে হ্যান্ডল হয় (নিচে দেখুন —
+    element split করে intermediate node বসানো হয়, "nearest-endpoint
+    snap" আচরণ আর নেই)।
+"""
+
+from typing import Any
+
+from model_conversion import (
+    convert_section_to_solver_units,
+    convert_material_to_solver_units,
+    convert_unit_weight_to_density,
+)
+from mesh_generation import generate_quad_mesh, MeshGenerationError
+
+LINE_ELEMENT_CATEGORIES = {"beam", "column", "brace", "pile"}
+# Slab/Wall/Shear-Wall/Core-Wall এখন shell element দিয়ে solve করা যায়
+# (mesh_generation.py এর polygon-to-quad-mesh, ও shell.cpp এর 4-node
+# quadrilateral shell stiffness — membrane+plate bending)। Footing
+# এখনো সমর্থিত না (এটা conceptually একটা point/pad support element,
+# slab এর মতো "floating" area element না — foundation-soil interaction
+# মডেলিং একটা ভিন্ন সমস্যা, Phase 7 Foundation Module এর কাজ)।
+SHELL_ELEMENT_CATEGORIES = {"slab", "wall", "shear-wall", "core-wall"}
+UNSUPPORTED_ELEMENT_CATEGORIES = {"footing", "combined-footing", "strip-footing", "mat-foundation", "pile-cap", "pile-group"}
+
+# positionRatio এই মান থেকে endpoint (0 বা 1) এর কতটা কাছে হলে সেটাকে
+# "কার্যত endpoint" ধরা হবে (নতুন split node না বসিয়ে সরাসরি existing
+# start/end node ব্যবহার করা হবে)। এটা floating-point noise থেকে
+# অপ্রয়োজনীয় অতি-ছোট sub-element তৈরি হওয়া ঠেকায়।
+ENDPOINT_SNAP_TOLERANCE = 1e-4
+
+
+class ModelParsingError(Exception):
+    """Element/material/section রেফারেন্স broken হলে (যেমন materialId যা library তে নেই)।"""
+
+
+def _find_by_id(items: list[dict[str, Any]], id_field: str, id_value: str) -> dict[str, Any]:
+    for item in items:
+        if item.get(id_field) == id_value:
+            return item
+    raise ModelParsingError(f"{id_field}='{id_value}' খুঁজে পাওয়া যায়নি — library তে অনুপস্থিত")
+
+
+def _interpolate_point(
+    start: dict[str, float], end: dict[str, float], ratio: float
+) -> dict[str, float]:
+    """start থেকে end পর্যন্ত সরলরেখা বরাবর ratio (0..1) অবস্থানের coordinate।"""
+    return {
+        "x": start["x"] + (end["x"] - start["x"]) * ratio,
+        "y": start["y"] + (end["y"] - start["y"]) * ratio,
+        "z": start["z"] + (end["z"] - start["z"]) * ratio,
+    }
+
+
+class NodeGraph:
+    """
+    Node তালিকা ও coordinate→index লুকআপ একসাথে বহন করে, যাতে
+    build_solver_model এর একাধিক ধাপ (element split point বসানো, load
+    application point বসানো) একই get_or_create_node() যুক্তি পুনরায়
+    ব্যবহার করতে পারে কোনো ডুপ্লিকেট node তৈরি না করে।
+    """
+
+    def __init__(self) -> None:
+        self.node_list: list[dict[str, float]] = []
+        self._coordinate_to_index: dict[tuple[float, float, float], int] = {}
+
+    def get_or_create_node(self, x: float, y: float, z: float) -> int:
+        # ১ মিলিমিটার precision এ রাউন্ড করে key বানানো হচ্ছে, যাতে
+        # floating-point এর সামান্য পার্থক্য (যেমন 5.000000001 বনাম
+        # 4.999999998) ভুলবশত দুটো আলাদা node হিসেবে গণ্য না হয়।
+        key = (round(x, 3), round(y, 3), round(z, 3))
+        if key in self._coordinate_to_index:
+            return self._coordinate_to_index[key]
+
+        index = len(self.node_list)
+        self.node_list.append({"nodeId": f"node-{index}", "x": x, "y": y, "z": z})
+        self._coordinate_to_index[key] = index
+        return index
+
+    def index_of(self, x: float, y: float, z: float) -> int | None:
+        key = (round(x, 3), round(y, 3), round(z, 3))
+        return self._coordinate_to_index.get(key)
+
+
+def build_node_graph(
+    elements: list[dict[str, Any]],
+) -> tuple[list[dict[str, float]], dict[tuple[float, float, float], int]]:
+    """
+    Line element গুলোর start/end point থেকে একটা unique node তালিকা
+    বানায়। দুটো element যদি একই coordinate এ মিলিত হয় (যেমন Beam এর
+    end point = Column এর top point), তাদের একই node হিসেবে merge
+    করা হয়।
+
+    নোট: এই ফাংশন শুধু element endpoint (start/end) থেকে node বানায় —
+    mid-span load split point এখানে অন্তর্ভুক্ত না (সেটা
+    build_solver_model এ আলাদাভাবে হ্যান্ডল হয়, কারণ split point শুধু
+    load-application-driven, geometry-driven না)। এই ফাংশন backward-
+    compatible রাখা হয়েছে (পুরনো signature/return shape অপরিবর্তিত)।
+    """
+    graph = NodeGraph()
+    for element in elements:
+        if element["category"] not in LINE_ELEMENT_CATEGORIES:
+            continue
+        start = element["startPoint"]
+        end = element["endPoint"]
+        graph.get_or_create_node(start["x"], start["y"], start["z"])
+        graph.get_or_create_node(end["x"], end["y"], end["z"])
+
+    return graph.node_list, graph._coordinate_to_index
+
+
+def build_solver_model(
+    elements: list[dict[str, Any]],
+    materials: list[dict[str, Any]],
+    sections: list[dict[str, Any]],
+    load_cases: list[dict[str, Any]],
+    supported_node_ids: set[str],
+) -> tuple[dict[str, Any], list[str], list[dict[str, Any]]]:
+    """
+    পূর্ণাঙ্গ solver input dict বানায়, একটা warnings তালিকা, এবং একটা
+    sub_element_registry রিটার্ন করে।
+
+    sub_element_registry: mid-span load এর কারণে element split হলে
+    কোন solver_elements[i] কোন original elementId থেকে এসেছে তার
+    ম্যাপিং — [{"originalElementId": str, "solverElementIndex": int,
+    "subStartRatio": float, "subEndRatio": float}, ...]। Split না
+    হলে প্রতিটা original element এর জন্য একটাই entry থাকে (ratio
+    0.0→1.0)। main.py এই তালিকা ব্যবহার করে elementEndForces কে আবার
+    original elementId এর সাথে যুক্ত করে ফেরত দেয় (C++ solver নিজে
+    শুধু positional index জানে, elementId-aware না)।
+
+    supported_node_ids: যেসব node এ boundary condition বসাতে হবে
+    (Phase 4a তে একটা সরলীকৃত heuristic ব্যবহার করা হচ্ছে: base story
+    এ থাকা সব node কে automatically fully-fixed support ধরা হয়)।
+    """
+    warnings: list[str] = []
+
+    skipped_elements = [e for e in elements if e["category"] in UNSUPPORTED_ELEMENT_CATEGORIES]
+    if skipped_elements:
+        categories = sorted({e["category"] for e in skipped_elements})
+        warnings.append(
+            f"⚠️ {len(skipped_elements)}টা element ({', '.join(categories)}) এই Phase এ solve করা "
+            f"যায়নি — এগুলো foundation-soil interaction element, যা এখনো implement করা হয়নি "
+            f"(ভবিষ্যৎ Phase এর কাজ)। ফলাফলে এই element গুলোর প্রভাব ধরা পড়েনি।"
+        )
+
+    line_elements = [e for e in elements if e["category"] in LINE_ELEMENT_CATEGORIES]
+    shell_source_elements = [e for e in elements if e["category"] in SHELL_ELEMENT_CATEGORIES]
+
+    if not line_elements and not shell_source_elements:
+        raise ModelParsingError(
+            "কোনো solve-যোগ্য (Beam/Column/Brace/Pile/Slab/Wall/Shear-Wall/Core-Wall) element "
+            "পাওয়া যায়নি"
+        )
+
+    brace_elements = [e for e in line_elements if e["category"] == "brace"]
+    if brace_elements:
+        warnings.append(
+            f"ℹ️ {len(brace_elements)}টা Brace element আছে — pin-connection release প্রয়োগ করা "
+            f"হয়েছে (উভয় প্রান্তে bending moment DOF release, static condensation দিয়ে)। "
+            f"⚠️ সীমাবদ্ধতা: এই মুহূর্তে single-end release সমর্থিত না — connectionType='pin' "
+            f"হলে element-এর উভয় প্রান্তই release হয়, একদিকে moment/অন্যদিকে pin এমন আংশিক "
+            f"release মডেল করা যায় না।"
+        )
+
+    # ধাপ ১: প্রতিটা line element-এ কোন positionRatio-তে mid-span point
+    # load আছে তা আগে থেকে জোগাড় করা, যাতে element split (ধাপ ৩) একবারেই
+    # সব split point জেনে করা যায়।
+    split_ratios_by_element: dict[str, set[float]] = {}
+    point_loads_only = [lc for lc in load_cases if lc["applicationType"] == "point"]
+    shell_source_ids = {e["elementId"] for e in shell_source_elements}
+    unsupported_shell_point_loads = 0
+    for load_case in point_loads_only:
+        if load_case["elementId"] in shell_source_ids:
+            # Shell element এ Point Load এখনো সমর্থিত না (এই ধাপে শুধু
+            # geometry/mesh solve করা হচ্ছে, shell এ load application
+            # ভবিষ্যতের কাজ) — silently ignore না করে গণনা রাখা হচ্ছে,
+            # নিচে একটা warning এ জানানো হবে।
+            unsupported_shell_point_loads += 1
+            continue
+        target_element = _find_by_id(line_elements, "elementId", load_case["elementId"])
+        ratio = load_case.get("positionRatio", 0.5)
+        if ENDPOINT_SNAP_TOLERANCE < ratio < (1 - ENDPOINT_SNAP_TOLERANCE):
+            split_ratios_by_element.setdefault(target_element["elementId"], set()).add(ratio)
+
+    if unsupported_shell_point_loads:
+        warnings.append(
+            f"⚠️ {unsupported_shell_point_loads}টা Point Load একটা Slab/Wall/Shear-Wall/Core-Wall "
+            f"element কে target করছে — shell element এ load application এখনো সমর্থিত না এই ধাপে "
+            f"(শুধু geometry/stiffness solve করা হচ্ছে), তাই এই load গুলো বাদ দেওয়া হয়েছে।"
+        )
+
+    # ধাপ ১.৫: প্রতিটা Slab/Wall/Shear-Wall/Core-Wall element কে quad
+    # mesh এ রূপান্তর করা (mesh_generation.py) — node graph বানানোর
+    # আগে করা হচ্ছে, যাতে mesh-generated quad corner point গুলোও
+    # (যার মধ্যে নতুন centroid/midpoint node থাকবে যা কোনো original
+    # element এর endpoint না) node graph এ অন্তর্ভুক্ত হয়।
+    #
+    # shell_meshes: elementId → list of quad (প্রতিটা quad = ৪টা
+    # {"x":..,"y":..,"z":..} dict এর তালিকা, counter-clockwise)
+    shell_meshes: dict[str, list[list[dict[str, float]]]] = {}
+    for shell_source in shell_source_elements:
+        try:
+            quads_3d = generate_quad_mesh(shell_source["vertices"])
+        except MeshGenerationError as mesh_error:
+            raise ModelParsingError(
+                f"'{shell_source.get('name', shell_source['elementId'])}' ({shell_source['category']}) "
+                f"এর mesh generation ব্যর্থ হয়েছে: {mesh_error}"
+            )
+        shell_meshes[shell_source["elementId"]] = [
+            [{"x": p[0], "y": p[1], "z": p[2]} for p in quad] for quad in quads_3d
+        ]
+
+    if shell_source_elements:
+        total_quads = sum(len(qs) for qs in shell_meshes.values())
+        warnings.append(
+            f"ℹ️ {len(shell_source_elements)}টা Slab/Wall/Shear-Wall/Core-Wall element মোট "
+            f"{total_quads}টা shell (quad) element এ mesh করা হয়েছে (ear-clipping triangulation + "
+            f"triangle-to-quad conversion)। ⚠️ সীমাবদ্ধতা: mesh density uniform/adaptive না — "
+            f"বড় বা জটিল-আকৃতির element এ mesh coarse হতে পারে, যা displacement/stress নির্ভুলতা "
+            f"প্রভাবিত করতে পারে। Element internal force (moment/shear per unit width) এই ধাপে "
+            f"এখনো রিপোর্ট করা হয় না — শুধু displacement ফলাফল পাওয়া যাবে।"
+        )
+
+    # ধাপ ২: Node graph — element endpoint (যথারীতি) + প্রতিটা split-
+    # প্রয়োজনীয় element-এর intermediate node(গুলো) + shell mesh corner।
+    graph = NodeGraph()
+    for element in line_elements:
+        start = element["startPoint"]
+        end = element["endPoint"]
+        graph.get_or_create_node(start["x"], start["y"], start["z"])
+        graph.get_or_create_node(end["x"], end["y"], end["z"])
+
+    for element in line_elements:
+        ratios = split_ratios_by_element.get(element["elementId"])
+        if not ratios:
+            continue
+        start = element["startPoint"]
+        end = element["endPoint"]
+        for ratio in ratios:
+            p = _interpolate_point(start, end, ratio)
+            graph.get_or_create_node(p["x"], p["y"], p["z"])
+
+    for quads in shell_meshes.values():
+        for quad in quads:
+            for corner in quad:
+                graph.get_or_create_node(corner["x"], corner["y"], corner["z"])
+
+    node_list = graph.node_list
+
+    def point_index(point: dict[str, float]) -> int:
+        idx = graph.index_of(point["x"], point["y"], point["z"])
+        if idx is None:
+            raise ModelParsingError(
+                f"Node coordinate ({point['x']}, {point['y']}, {point['z']}) node graph এ পাওয়া "
+                f"যায়নি — এটা একটা internal bug।"
+            )
+        return idx
+
+    # ধাপ ৩: প্রতিটা line element কে এক বা একাধিক sub-element এ রূপান্তর।
+    # Split প্রয়োজন না হলে element অপরিবর্তিত (১টা sub-element)। Split
+    # হলে sorted ratio অনুযায়ী ধারাবাহিক sub-element — প্রতিটার section/
+    # material মূল element থেকে অভিন্ন।
+    #
+    # connectionType handling: internal cut point এ সবসময় rigid/moment
+    # continuity — mid-span লোড শুধু numerical split, physical hinge না।
+    sub_element_registry: list[dict[str, Any]] = []
+    solver_elements: list[dict[str, Any]] = []
+
+    for element in line_elements:
+        material = _find_by_id(materials, "materialId", element["materialId"])
+        section = _find_by_id(sections, "sectionId", element["sectionId"])
+
+        if "properties" not in section:
+            raise ModelParsingError(
+                f"Section '{section.get('name', element['sectionId'])}' এর geometric properties "
+                f"পাওয়া যায়নি — request payload এ precomputed section properties অন্তর্ভুক্ত করা "
+                f"আছে কিনা যাচাই করুন (frontend এর computeSectionProperties() থেকে)।"
+            )
+
+        # yieldMomentMzKNm/yieldMomentMyKNm (Nonlinear Static Analysis)
+        # frontend এর BaseSection টাইপে top-level field হিসেবে থাকে
+        # (src/lib/types/section.ts), কিন্তু section["properties"] হলো
+        # computeSectionProperties() এর আউটপুট (শুধু geometry:
+        # area/ixx/iyy/j/centroidY) — সেখানে yield capacity থাকে না।
+        # তাই এখানে দুটো উৎস merge করা হচ্ছে convert_section_to_solver_units()
+        # এ পাঠানোর আগে।
+        section_properties_with_yield = {
+            **section["properties"],
+            "yieldMomentMzKNm": section.get("yieldMomentMzKNm", 0.0),
+            "yieldMomentMyKNm": section.get("yieldMomentMyKNm", 0.0),
+        }
+        section_m = convert_section_to_solver_units(section_properties_with_yield)
+
+        if material["type"] == "concrete":
+            fc = material["fc"]
+            ec_override = material.get("ec")
+            elastic_modulus_mpa = ec_override if ec_override is not None else 4700 * (fc ** 0.5)
+            poissons_ratio = material.get("poissonsRatio", 0.2)
+        elif material["type"] == "steel":
+            elastic_modulus_mpa = material["es"]
+            poissons_ratio = material.get("poissonsRatio", 0.3)
+        else:
+            raise ModelParsingError(
+                f"Material type '{material['type']}' এখনো solver এ সমর্থিত না (শুধু concrete/steel)।"
+            )
+
+        shear_modulus_mpa = elastic_modulus_mpa / (2 * (1 + poissons_ratio))
+        material_converted = convert_material_to_solver_units(elastic_modulus_mpa, shear_modulus_mpa)
+        # Modal Analysis এর mass matrix গণনার জন্য material density যোগ
+        # করা হচ্ছে — Linear Static Analysis এ এই key ব্যবহৃত হয় না
+        # (bindings.cpp এ optional হিসেবে handle করা আছে), তাই এই যোগ
+        # করা Linear Static এর কোনো existing আচরণ বদলায় না।
+        material_converted["density"] = convert_unit_weight_to_density(material["unitWeight"])
+
+        connection_type = element.get("connectionType", "moment")
+        ratios = sorted(split_ratios_by_element.get(element["elementId"], set()))
+        boundary_ratios = [0.0] + ratios + [1.0]
+
+        start_pt = element["startPoint"]
+        end_pt = element["endPoint"]
+
+        for i in range(len(boundary_ratios) - 1):
+            r0 = boundary_ratios[i]
+            r1 = boundary_ratios[i + 1]
+            p0 = start_pt if r0 == 0.0 else _interpolate_point(start_pt, end_pt, r0)
+            p1 = end_pt if r1 == 1.0 else _interpolate_point(start_pt, end_pt, r1)
+
+            is_first_sub = (i == 0)
+            is_last_sub = (i == len(boundary_ratios) - 2)
+            sub_connection_type = connection_type if (is_first_sub or is_last_sub) else "moment"
+            # নোট: বর্তমান solver "pin" কে সবসময় both-end release হিসেবে
+            # treat করে (getEffectiveLocalStiffness, stiffness.h দেখুন)।
+            # তাই একটা multi-sub-element pin member এ sub_connection_type=
+            # "pin" থাকলে সেই sub-element এর *দুই* প্রান্তই release হবে,
+            # শুধু বাইরের প্রান্ত না — এটা split pin element এর জন্য
+            # conservative approximation, নিচে warning এ জানানো আছে।
+
+            # Plastic hinge assignment (Nonlinear Static Analysis) — শুধু
+            # physical outer প্রান্তে বসে (connectionType এর মতোই
+            # যুক্তিতে), internal split (mid-span load cut) point এ না।
+            # একটা physical hinge মূল element এর প্রকৃত প্রান্তে থাকে
+            # (যেমন column base) — mid-span split সম্পূর্ণ numerical
+            # কারণে, সেই কৃত্রিম cut point এ hinge বসানো ভুল হবে (একটা
+            # continuous element কে ভুলভাবে দুইটা যৌগিক hinge-behavior
+            # সহ element বানিয়ে ফেলবে)।
+            sub_hinge_at_start = element.get("hingeAtStart", False) if is_first_sub else False
+            sub_hinge_at_end = element.get("hingeAtEnd", False) if is_last_sub else False
+
+            solver_element_index = len(solver_elements)
+            solver_elements.append({
+                "elementId": f"{element['elementId']}#{i}" if len(boundary_ratios) > 2 else element["elementId"],
+                "startNodeIndex": point_index(p0),
+                "endNodeIndex": point_index(p1),
+                "connectionType": sub_connection_type,
+                "section": section_m,
+                "material": material_converted,
+                "hingeAtStart": sub_hinge_at_start,
+                "hingeAtEnd": sub_hinge_at_end,
+            })
+            sub_element_registry.append({
+                "originalElementId": element["elementId"],
+                "solverElementIndex": solver_element_index,
+                "subStartRatio": r0,
+                "subEndRatio": r1,
+            })
+
+    split_pin_elements = [
+        e["elementId"] for e in line_elements
+        if e.get("connectionType") == "pin" and e["elementId"] in split_ratios_by_element
+    ]
+    if split_pin_elements:
+        warnings.append(
+            f"⚠️ {len(split_pin_elements)}টা pin-connected element ({', '.join(split_pin_elements)}) "
+            f"এ mid-span point load থাকায় সেগুলো split করা হয়েছে — কিন্তু বর্তমান সলভার 'pin' কে "
+            f"সবসময় sub-element এর উভয় প্রান্তে release করে, তাই split point (internal cut) এও "
+            f"অনিচ্ছাকৃতভাবে moment release হয়ে যাচ্ছে। ছোট মডেলে প্রভাব সীমিত হতে পারে, কিন্তু "
+            f"নির্ভুল ফলাফলের জন্য এই সীমাবদ্ধতা মাথায় রাখুন।"
+        )
+
+    # -----------------------------------------------------------------
+    # ধাপ ৩.৫: Shell (Slab/Wall/Shear-Wall/Core-Wall) element assembly —
+    # প্রতিটা mesh-generated quad কে একটা solver shellElement এ রূপান্তর
+    # করা, node graph এ ইতিমধ্যে যোগ হওয়া corner coordinate ব্যবহার করে
+    # (point_index() দিয়ে lookup)।
+    # -----------------------------------------------------------------
+    solver_shell_elements: list[dict[str, Any]] = []
+    for shell_source in shell_source_elements:
+        material = _find_by_id(materials, "materialId", shell_source["materialId"])
+
+        if material["type"] == "concrete":
+            fc = material["fc"]
+            ec_override = material.get("ec")
+            elastic_modulus_mpa = ec_override if ec_override is not None else 4700 * (fc ** 0.5)
+            poissons_ratio = material.get("poissonsRatio", 0.2)
+        elif material["type"] == "steel":
+            elastic_modulus_mpa = material["es"]
+            poissons_ratio = material.get("poissonsRatio", 0.3)
+        else:
+            raise ModelParsingError(
+                f"Material type '{material['type']}' এখনো shell element এ সমর্থিত না (শুধু "
+                f"concrete/steel)।"
+            )
+
+        shell_material_converted = convert_material_to_solver_units(elastic_modulus_mpa, elastic_modulus_mpa)
+        # নোট: convert_material_to_solver_units() দুইটা আর্গুমেন্ট নেয়
+        # (E ও G), কিন্তু shell element G সরাসরি ব্যবহার করে না (G,
+        # poissonsRatio থেকে shell.cpp এর ভেতরেই derive হয় shear
+        # constitutive matrix এর জন্য) — তাই এখানে শুধু elasticModulus
+        # ব্যবহার করা হবে dict থেকে, shearModulus entry থাকলেও ignore
+        # হবে (bindings.cpp এর parseModelFromDict এ shell এর জন্য
+        # shearModulus ঐচ্ছিক)।
+        shell_material_converted["poissonsRatio"] = poissons_ratio
+        shell_material_converted["density"] = convert_unit_weight_to_density(material["unitWeight"])
+
+        thickness_m = shell_source["thickness"] / 1000.0  # mm → m (element.ts এ thickness: number // mm)
+
+        for quad_idx, quad in enumerate(shell_meshes[shell_source["elementId"]]):
+            node_indices = [point_index(corner) for corner in quad]
+            solver_shell_elements.append({
+                "elementId": f"{shell_source['elementId']}#{quad_idx}",
+                "nodeIndices": node_indices,
+                "thickness": thickness_m,
+                "material": shell_material_converted,
+            })
+
+    # Boundary conditions — base-level heuristic
+    boundary_conditions = []
+    for i, node in enumerate(node_list):
+        if node["nodeId"] in supported_node_ids or node["y"] <= 1e-3:
+            boundary_conditions.append({
+                "nodeIndex": i,
+                "restrainX": True, "restrainY": True, "restrainZ": True,
+                "restrainRx": True, "restrainRy": True, "restrainRz": True,
+            })
+
+    if boundary_conditions:
+        warnings.append(
+            f"ℹ️ {len(boundary_conditions)}টা node কে স্বয়ংক্রিয়ভাবে fully-fixed support ধরা "
+            f"হয়েছে (elevation Y≈0 হওয়ার ভিত্তিতে) — এটা একটা preliminary heuristic, প্রকৃত "
+            f"support condition define করার UI এখনো নেই। এই মুহূর্তে ফলাফল সেই সতর্কতার সাথে "
+            f"ব্যবহার করুন।"
+        )
+    else:
+        warnings.append(
+            "⚠️ কোনো node base level (Y≈0) এ পাওয়া যায়নি — কোনো boundary condition বসানো "
+            "হয়নি, সলভার ব্যর্থ হবে (unstable structure)।"
+        )
+
+    # ধাপ ৪: Load conversion — mid-span point load এখন actual position-এর
+    # node-এ সরাসরি apply হয় (split node), কোনো nearest-endpoint snap নেই।
+    solver_loads = []
+    unsupported_load_types = set()
+
+    for load_case in load_cases:
+        if load_case["applicationType"] != "point":
+            unsupported_load_types.add(load_case["applicationType"])
+            continue
+        if load_case["elementId"] in shell_source_ids:
+            continue  # উপরে (split-ratio scanning ধাপে) ইতিমধ্যে warning যোগ করা হয়েছে
+
+        target_element = _find_by_id(line_elements, "elementId", load_case["elementId"])
+        ratio = load_case.get("positionRatio", 0.5)
+
+        if ratio <= ENDPOINT_SNAP_TOLERANCE:
+            point = target_element["startPoint"]
+        elif ratio >= (1 - ENDPOINT_SNAP_TOLERANCE):
+            point = target_element["endPoint"]
+        else:
+            point = _interpolate_point(target_element["startPoint"], target_element["endPoint"], ratio)
+
+        node_idx = point_index(point)
+
+        solver_loads.append({
+            "nodeIndex": node_idx,
+            "fx": load_case["forceX"], "fy": load_case["forceY"], "fz": load_case["forceZ"],
+            "mx": 0, "my": 0, "mz": 0,
+        })
+
+    if unsupported_load_types:
+        warnings.append(
+            f"⚠️ এই লোড টাইপ গুলো এই Phase এ সমর্থিত না, বাদ দেওয়া হয়েছে: "
+            f"{', '.join(sorted(unsupported_load_types))} (শুধু Point Load বর্তমানে ব্যবহারযোগ্য)।"
+        )
+
+    if not solver_loads and not solver_shell_elements:
+        warnings.append("⚠️ কোনো ব্যবহারযোগ্য (Point) load পাওয়া যায়নি — সলভার শূন্য-লোড অবস্থায় চলবে।")
+    elif not solver_loads and solver_shell_elements:
+        warnings.append(
+            "ℹ️ কোনো Point Load নেই — শুধু shell (Slab/Wall) geometry/stiffness solve হয়েছে "
+            "(shell এ load application এখনো সমর্থিত না, উপরে দেখুন)।"
+        )
+
+    solver_input = {
+        "nodes": node_list,
+        "elements": solver_elements,
+        "shellElements": solver_shell_elements,
+        "boundaryConditions": boundary_conditions,
+        "loads": solver_loads,
+    }
+
+    return solver_input, warnings, sub_element_registry

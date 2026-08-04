@@ -8,3 +8,4 @@ venv/
 .gitignore
 README.md
 .github/
+cpp/build/
