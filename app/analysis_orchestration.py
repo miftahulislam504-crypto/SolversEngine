@@ -29,12 +29,12 @@ frontend-বোধগম্য shape এ ফেরত দেয়।
 
 from typing import Any
 
-from model_conversion import (
+from app.model_conversion import (
     convert_section_to_solver_units,
     convert_material_to_solver_units,
     convert_unit_weight_to_density,
 )
-from mesh_generation import generate_quad_mesh, MeshGenerationError
+from app.mesh_generation import generate_quad_mesh, MeshGenerationError
 
 LINE_ELEMENT_CATEGORIES = {"beam", "column", "brace", "pile"}
 # Slab/Wall/Shear-Wall/Core-Wall এখন shell element দিয়ে solve করা যায়

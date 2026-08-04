@@ -33,8 +33,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from analysis_orchestration import ModelParsingError, build_solver_model
-from response_spectrum import build_bnbc_2020_spectrum
+from app.analysis_orchestration import ModelParsingError, build_solver_model
+from app.response_spectrum import build_bnbc_2020_spectrum
 
 # civilos_solver (কম্পাইল করা C++ pybind11 module) খুঁজে পাওয়ার জন্য
 # দুটো সম্ভাব্য জায়গা:
