@@ -181,6 +181,20 @@ class AnalysisJobRequest(BaseModel):
         description="analysis_type='pushover' এর জন্য — সর্বোচ্চ push step সংখ্যা (safety limit, "
         "target displacement এ কখনো না পৌঁছালে অসীম loop এড়াতে)।",
     )
+    support_overrides: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Phase 5 — hardcoded 'base = fixed' (Y≈0) heuristic override করার ঐচ্ছিক "
+        "input। প্রতিটা entry: {'x': float, 'y': float, 'z': float, 'supportType': "
+        "'fixed'|'pinned'|'free'|'custom', 'restrainX'/'restrainY'/'restrainZ'/'restrainRx'/"
+        "'restrainRy'/'restrainRz': bool (শুধু supportType='custom' হলে আবশ্যক)}। (x,y,z) কে "
+        "solver model এর কোনো node coordinate এর সাথে ম্যাচ করে resolve করা হয় (control_point_x "
+        "এর মতো একই 3-decimal rounding পদ্ধতিতে — build_solver_model() এর node_list এ, "
+        "raw solver node index পাঠানো সম্ভব না কারণ node merging/split internal)। কোনো coordinate "
+        "কোনো node এর সাথে না মিললে সেই entry নীরবে বাদ যায় না — একটা warning এ জানানো হয়, request "
+        "ব্যর্থ হয় না (partial override এর ক্ষেত্রে বাকি override গুলো তবুও প্রয়োগ হয়)। None বা খালি "
+        "list দিলে পুরনো Y≈0-based heuristic অপরিবর্তিতভাবে চলবে (backward compatible)। একই "
+        "coordinate একাধিকবার override হলে শেষেরটা জিতবে।",
+    )
 
 
 class AnalysisJobResponse(BaseModel):
@@ -293,6 +307,7 @@ def submit_analysis_job(request: AnalysisJobRequest) -> AnalysisJobResponse:
             sections=sections,
             load_cases=load_cases,
             supported_node_ids=set(),  # Phase 4a তে explicit support marking নেই, docstring দেখুন analysis_orchestration.py এ
+            support_overrides=request.support_overrides,  # Phase 5 — ঐচ্ছিক, None হলে heuristic অপরিবর্তিত থাকে
         )
     except ModelParsingError as parsing_error:
         raise HTTPException(

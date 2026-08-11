@@ -138,6 +138,7 @@ def build_solver_model(
     sections: list[dict[str, Any]],
     load_cases: list[dict[str, Any]],
     supported_node_ids: set[str],
+    support_overrides: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], list[str], list[dict[str, Any]]]:
     """
     পূর্ণাঙ্গ solver input dict বানায়, একটা warnings তালিকা, এবং একটা
@@ -155,6 +156,22 @@ def build_solver_model(
     supported_node_ids: যেসব node এ boundary condition বসাতে হবে
     (Phase 4a তে একটা সরলীকৃত heuristic ব্যবহার করা হচ্ছে: base story
     এ থাকা সব node কে automatically fully-fixed support ধরা হয়)।
+
+    support_overrides (Phase 5): ঐচ্ছিক — coordinate-ভিত্তিক support
+    override, Y≈0 heuristic কে override/supplement করে। প্রতিটা entry:
+    {"x", "y", "z", "supportType": "fixed"|"pinned"|"free"|"custom",
+    "restrainX"..."restrainRz" (শুধু supportType="custom" হলে পড়া হয়)}।
+    "fixed" মানে সব ৬ DOF restrain, "pinned" মানে শুধু ৩টা translation
+    restrain (rotation free — geotechnically একটা সরলীকরণ, প্রকৃত pile/
+    footing rotational stiffness এখানে model করা হয় না), "free" মানে
+    কোনো DOF-ই restrain না (ওই coordinate এ heuristic থেকে support বাদ
+    দিতে, যেমন ভুলভাবে Y≈0 এ ধরা পড়া non-support node)। কোনো override
+    coordinate কোনো node এর সাথে না মিললে warning এ জানানো হয়, silent
+    ignore হয় না। override প্রয়োগের ক্রম: প্রথমে Y≈0 heuristic দিয়ে base
+    boundary_conditions dict বানানো হয় (নিচে), তারপর override গুলো সেই
+    dict এ coordinate-key দিয়ে বসানো/প্রতিস্থাপন করা হয় — অর্থাৎ override
+    সবসময় heuristic কে জেতে, override না থাকা node গুলো heuristic
+    অনুযায়ীই থাকে।
     """
     warnings: list[str] = []
 
@@ -448,27 +465,90 @@ def build_solver_model(
             })
 
     # Boundary conditions — base-level heuristic
-    boundary_conditions = []
+    boundary_conditions_by_node_index: dict[int, dict[str, Any]] = {}
     for i, node in enumerate(node_list):
         if node["nodeId"] in supported_node_ids or node["y"] <= 1e-3:
-            boundary_conditions.append({
+            boundary_conditions_by_node_index[i] = {
                 "nodeIndex": i,
                 "restrainX": True, "restrainY": True, "restrainZ": True,
                 "restrainRx": True, "restrainRy": True, "restrainRz": True,
-            })
+            }
 
-    if boundary_conditions:
+    heuristic_count = len(boundary_conditions_by_node_index)
+    if heuristic_count:
         warnings.append(
-            f"ℹ️ {len(boundary_conditions)}টা node কে স্বয়ংক্রিয়ভাবে fully-fixed support ধরা "
+            f"ℹ️ {heuristic_count}টা node কে স্বয়ংক্রিয়ভাবে fully-fixed support ধরা "
             f"হয়েছে (elevation Y≈0 হওয়ার ভিত্তিতে) — এটা একটা preliminary heuristic, প্রকৃত "
             f"support condition define করার UI এখনো নেই। এই মুহূর্তে ফলাফল সেই সতর্কতার সাথে "
             f"ব্যবহার করুন।"
         )
-    else:
+    elif not support_overrides:
         warnings.append(
             "⚠️ কোনো node base level (Y≈0) এ পাওয়া যায়নি — কোনো boundary condition বসানো "
             "হয়নি, সলভার ব্যর্থ হবে (unstable structure)।"
         )
+
+    # Phase 5 — support_overrides প্রয়োগ। heuristic এর ফলাফল উপরে
+    # ইতিমধ্যে তৈরি হয়ে গেছে, override সেটাকে coordinate-key দিয়ে
+    # বসিয়ে/প্রতিস্থাপন করে — override সবসময় heuristic কে জেতে।
+    SUPPORT_TYPE_DOF_PRESETS = {
+        "fixed": {"restrainX": True, "restrainY": True, "restrainZ": True, "restrainRx": True, "restrainRy": True, "restrainRz": True},
+        "pinned": {"restrainX": True, "restrainY": True, "restrainZ": True, "restrainRx": False, "restrainRy": False, "restrainRz": False},
+        "free": {"restrainX": False, "restrainY": False, "restrainZ": False, "restrainRx": False, "restrainRy": False, "restrainRz": False},
+    }
+    if support_overrides:
+        applied_count = 0
+        unmatched_overrides = 0
+        for override in support_overrides:
+            node_index = graph.index_of(override["x"], override["y"], override["z"])
+            if node_index is None:
+                unmatched_overrides += 1
+                continue
+
+            support_type = override.get("supportType", "fixed")
+            if support_type == "custom":
+                dof_flags = {
+                    "restrainX": bool(override.get("restrainX", False)),
+                    "restrainY": bool(override.get("restrainY", False)),
+                    "restrainZ": bool(override.get("restrainZ", False)),
+                    "restrainRx": bool(override.get("restrainRx", False)),
+                    "restrainRy": bool(override.get("restrainRy", False)),
+                    "restrainRz": bool(override.get("restrainRz", False)),
+                }
+            elif support_type in SUPPORT_TYPE_DOF_PRESETS:
+                dof_flags = SUPPORT_TYPE_DOF_PRESETS[support_type]
+            else:
+                warnings.append(
+                    f"⚠️ support_overrides এ অজানা supportType (\"{support_type}\") — এই override "
+                    f"({override['x']}, {override['y']}, {override['z']}) বাদ দেওয়া হয়েছে।"
+                )
+                continue
+
+            if support_type == "free":
+                boundary_conditions_by_node_index.pop(node_index, None)
+            else:
+                boundary_conditions_by_node_index[node_index] = {"nodeIndex": node_index, **dof_flags}
+            applied_count += 1
+
+        if applied_count:
+            warnings.append(
+                f"ℹ️ {applied_count}টা support_override প্রয়োগ করা হয়েছে (Y≈0 heuristic কে "
+                f"override/supplement করে) — উপরের fully-fixed heuristic count এ এই পরিবর্তন "
+                f"প্রতিফলিত না, নিচের চূড়ান্ত boundary condition তালিকাতেই আসল ফলাফল।"
+            )
+        if unmatched_overrides:
+            warnings.append(
+                f"⚠️ {unmatched_overrides}টা support_override এর coordinate মডেলের কোনো node এর "
+                f"সাথে মেলেনি (নীরবে বাদ দেওয়া হয়েছে) — coordinate ভুল, বা সেই বিন্দুতে কোনো element "
+                f"endpoint নেই কিনা যাচাই করুন।"
+            )
+        if not boundary_conditions_by_node_index:
+            warnings.append(
+                "⚠️ সব boundary condition override দিয়ে সরিয়ে ফেলা হয়েছে (supportType='free') — "
+                "কোনো boundary condition বসানো হয়নি, সলভার ব্যর্থ হবে (unstable structure)।"
+            )
+
+    boundary_conditions = list(boundary_conditions_by_node_index.values())
 
     # ধাপ ৪: Load conversion — mid-span point load এখন actual position-এর
     # node-এ সরাসরি apply হয় (split node), কোনো nearest-endpoint snap নেই।
