@@ -7,26 +7,36 @@ Analysis Orchestration — Frontend Model → Solver Call
 C++ solver এর জন্য প্রয়োজনীয় node graph বানায়, এবং ফলাফল আবার
 frontend-বোধগম্য shape এ ফেরত দেয়।
 
-গুরুত্বপূর্ণ সীমাবদ্ধতা (Phase 4a):
-  - শুধু Line Element (Beam, Column, Brace, Pile) সমর্থিত। Slab/Wall/
-    Shear Wall/Core Wall/Footing — এগুলো Area/Point element, যাদের FE
-    mesh discretization প্রয়োজন যা এখনো নেই (Master Plan এর FE Module,
-    Phase 4 এর পরের ধাপ)। এই মডিউল এমন element পেলে সেগুলো solve করার
-    চেষ্টা না করে explicit ভাবে skip করে এবং warning রিপোর্ট করে —
-    silent-drop না।
+গুরুত্বপূর্ণ সীমাবদ্ধতা (Phase 4a, আপডেট করা হয়েছে uniform load conversion যোগ হওয়ার পর):
+  - Line Element (Beam, Column, Brace, Pile) সম্পূর্ণ সমর্থিত। Slab/
+    Wall/Shear-Wall/Core-Wall shell element হিসেবে mesh+solve হয়
+    (mesh_generation.py, shell.cpp — membrane+plate bending stiffness),
+    কিন্তু shell এর জন্য এখনো internal force/moment recovery নেই (শুধু
+    displacement/reaction পাওয়া যায়, stress contour একটা honest
+    displacement-magnitude proxy)। Footing/Combined-Footing/Strip-
+    Footing/Mat-Foundation/Pile-Cap/Pile-Group — এগুলো foundation-soil
+    interaction element, এখনো সমর্থিত না (ভবিষ্যৎ Phase এর কাজ), skip
+    হয়ে explicit warning সহ রিপোর্ট হয়, silent-drop না।
   - "pin" connectionType (Brace) এখন প্রয়োগ করা হয় (static condensation,
     cpp/src/stiffness.cpp এর applyEndReleases()), কিন্তু শুধু both-end
     release হিসেবে — single-end release সমর্থিত না (বিস্তারিত নিচে
     element assembly অংশে)।
-  - Uniform line/area load কে এখনো equivalent nodal load এ রূপান্তর
-    করা হয় না (এটা নিজেই একটা নির্ভুল সূত্র দাবি করে — fixed-end
-    moment/shear থেকে আসা equivalent load, যা একটা future ধাপ)। এই
-    মুহূর্তে শুধু Point Load সরাসরি ব্যবহারযোগ্য।
+  - Uniform-line ও uniform-area load এখন equivalent nodal load এ
+    রূপান্তরিত হয় (নিচে ধাপ ৪ দেখুন) — uniform-line কে প্রতিটা
+    sub-element এ w·L_sub/2 করে দুই প্রান্তে lump করা হয় (simply-
+    supported approximation, exact fixed-end-moment consistent load
+    না)। uniform-area কে shell mesh এর প্রতিটা quad এ area×intensity÷4
+    করে ৪টা corner এ lump করা হয়। দুটোই total force সংরক্ষণ করে
+    (নির্ভুল), কিন্তু span/quad এর মাঝামাঝি internal force diagram
+    সামান্য approximate — ছোট mesh এ প্রভাব নগণ্য, বড় uniform-area
+    load এর ক্ষেত্রে shell এর internal force recovery না থাকার কারণে
+    stress/moment ফলাফল এমনিতেও পাওয়া যায় না।
   - Mid-span Point Load এখন সঠিকভাবে হ্যান্ডল হয় (নিচে দেখুন —
     element split করে intermediate node বসানো হয়, "nearest-endpoint
     snap" আচরণ আর নেই)।
 """
 
+import math
 from typing import Any
 
 from app.model_conversion import (
@@ -73,6 +83,40 @@ def _interpolate_point(
         "y": start["y"] + (end["y"] - start["y"]) * ratio,
         "z": start["z"] + (end["z"] - start["z"]) * ratio,
     }
+
+
+def _vector_length(start: dict[str, float], end: dict[str, float]) -> float:
+    """দুইটা 3D point এর মধ্যে সরলরেখার দৈর্ঘ্য (m, ইনপুট coordinate এর একক অনুযায়ী)।"""
+    return math.sqrt(
+        (end["x"] - start["x"]) ** 2 + (end["y"] - start["y"]) ** 2 + (end["z"] - start["z"]) ** 2
+    )
+
+
+def _cross(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def _quad_area_3d(corners: list[dict[str, float]]) -> float:
+    """
+    একটা planar quad (৪টা 3D corner, counter-clockwise) এর ক্ষেত্রফল —
+    দুইটা ত্রিভুজে ভেঙে (0-1-2, 0-2-3) প্রতিটার cross-product magnitude/2
+    যোগ করে (shoelace formula এর 3D সাধারণীকরণ)। mesh_generation.py এর
+    generate_quad_mesh() সবসময় একটা planar polygon থেকে quad তৈরি করে
+    (2D projection → unproject), তাই non-planar warping নিয়ে চিন্তা
+    করার দরকার নেই।
+    """
+    p0 = (corners[0]["x"], corners[0]["y"], corners[0]["z"])
+    p1 = (corners[1]["x"], corners[1]["y"], corners[1]["z"])
+    p2 = (corners[2]["x"], corners[2]["y"], corners[2]["z"])
+    p3 = (corners[3]["x"], corners[3]["y"], corners[3]["z"])
+
+    def tri_area(a: tuple[float, float, float], b: tuple[float, float, float], c: tuple[float, float, float]) -> float:
+        ab = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+        ac = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
+        cx, cy, cz = _cross(ab, ac)
+        return 0.5 * math.sqrt(cx ** 2 + cy ** 2 + cz ** 2)
+
+    return tri_area(p0, p1, p2) + tri_area(p0, p2, p3)
 
 
 class NodeGraph:
@@ -550,49 +594,163 @@ def build_solver_model(
 
     boundary_conditions = list(boundary_conditions_by_node_index.values())
 
-    # ধাপ ৪: Load conversion — mid-span point load এখন actual position-এর
-    # node-এ সরাসরি apply হয় (split node), কোনো nearest-endpoint snap নেই।
+    # ধাপ ৪: Load conversion — point load সরাসরি actual position-এর node-এ
+    # apply হয় (mid-span split node, নিচে)। uniform-line/uniform-area load
+    # কে "equivalent nodal load" এ রূপান্তর করা হয় (নিচে বিস্তারিত) — এটা
+    # standard FE practice, কোনো নতুন element type বা solver পরিবর্তন
+    # লাগে না, C++ সলভার শুধু NodalLoad-ই চেনে (assembleGlobalLoadVector()
+    # প্রতিটা node-এ একাধিক load entry থাকলে += দিয়ে সরাসরি sum করে, তাই
+    # একই node-এ একাধিক sub-element/quad থেকে contribution আলাদা entry
+    # হিসেবে append করাই যথেষ্ট, আগে থেকে accumulate করার দরকার নেই)।
     solver_loads = []
     unsupported_load_types = set()
+    uniform_load_applied = False
+
+    # elementId → তার সব sub-element registry entry (একাধিক হতে পারে যদি
+    # mid-span point load এর কারণে split হয়ে থাকে) — uniform-line load কে
+    # প্রতিটা sub-segment এ আলাদাভাবে distribute করার জন্য।
+    sub_elements_by_original: dict[str, list[dict[str, Any]]] = {}
+    for entry in sub_element_registry:
+        sub_elements_by_original.setdefault(entry["originalElementId"], []).append(entry)
 
     for load_case in load_cases:
-        if load_case["applicationType"] != "point":
-            unsupported_load_types.add(load_case["applicationType"])
-            continue
-        if load_case["elementId"] in shell_source_ids:
-            continue  # উপরে (split-ratio scanning ধাপে) ইতিমধ্যে warning যোগ করা হয়েছে
+        application_type = load_case["applicationType"]
 
-        target_element = _find_by_id(line_elements, "elementId", load_case["elementId"])
-        ratio = load_case.get("positionRatio", 0.5)
+        if application_type == "point":
+            if load_case["elementId"] in shell_source_ids:
+                continue  # উপরে (split-ratio scanning ধাপে) ইতিমধ্যে warning যোগ করা হয়েছে
 
-        if ratio <= ENDPOINT_SNAP_TOLERANCE:
-            point = target_element["startPoint"]
-        elif ratio >= (1 - ENDPOINT_SNAP_TOLERANCE):
-            point = target_element["endPoint"]
+            target_element = _find_by_id(line_elements, "elementId", load_case["elementId"])
+            ratio = load_case.get("positionRatio", 0.5)
+
+            if ratio <= ENDPOINT_SNAP_TOLERANCE:
+                point = target_element["startPoint"]
+            elif ratio >= (1 - ENDPOINT_SNAP_TOLERANCE):
+                point = target_element["endPoint"]
+            else:
+                point = _interpolate_point(target_element["startPoint"], target_element["endPoint"], ratio)
+
+            node_idx = point_index(point)
+
+            solver_loads.append({
+                "nodeIndex": node_idx,
+                "fx": load_case["forceX"], "fy": load_case["forceY"], "fz": load_case["forceZ"],
+                "mx": 0, "my": 0, "mz": 0,
+            })
+
+        elif application_type == "uniform-line":
+            if load_case["elementId"] in shell_source_ids:
+                continue
+
+            target_element = _find_by_id(line_elements, "elementId", load_case["elementId"])
+            total_length = _vector_length(target_element["startPoint"], target_element["endPoint"])
+            sub_entries = sub_elements_by_original.get(load_case["elementId"], [])
+
+            if not sub_entries:
+                # mid-span point load না থাকলে element split হয়নি, কিন্তু
+                # sub_element_registry তে তবুও একটা single "0.0→1.0"
+                # sub-element থাকার কথা (build_solver_model এর element
+                # assembly loop সবসময় অন্তত একটা sub-element রেজিস্টার
+                # করে) — তাই খালি থাকলে সেটা একটা প্রকৃত অসঙ্গতি, নীরবে
+                # বাদ না দিয়ে warning দেওয়া হচ্ছে।
+                warnings.append(
+                    f"⚠️ Uniform Line Load এর element '{load_case['elementId']}' এর জন্য কোনো "
+                    f"sub-element registry entry পাওয়া যায়নি — এই লোড প্রয়োগ করা যায়নি।"
+                )
+                continue
+
+            # frontend এর intensityX/Y/Z পুরো original element এর length
+            # বরাবর ধ্রুবক (kN/m, module-data.ts এর UniformLineLoadCase
+            # দেখুন) — প্রতিটা sub-segment এ তার নিজস্ব দৈর্ঘ্য অনুপাতে
+            # total force ভাগ হবে, তারপর সেই sub-segment এর দুই প্রান্তে
+            # w·L_sub/2 করে lump হবে (simply-supported equivalent nodal
+            # load — standard consistent/lumped load conversion, exact
+            # fixed-end-moment consistent load না, কিন্তু ছোট mesh এ
+            # যথেষ্ট নির্ভুল approximation, warning এ জানানো আছে)।
+            intensity = (
+                load_case.get("forceX", 0.0),
+                load_case.get("forceY", 0.0),
+                load_case.get("forceZ", 0.0),
+            )
+            for sub in sub_entries:
+                sub_length = (sub["subEndRatio"] - sub["subStartRatio"]) * total_length
+                solver_element = solver_elements[sub["solverElementIndex"]]
+                half_force = tuple(v * sub_length / 2.0 for v in intensity)
+
+                solver_loads.append({
+                    "nodeIndex": solver_element["startNodeIndex"],
+                    "fx": half_force[0], "fy": half_force[1], "fz": half_force[2],
+                    "mx": 0, "my": 0, "mz": 0,
+                })
+                solver_loads.append({
+                    "nodeIndex": solver_element["endNodeIndex"],
+                    "fx": half_force[0], "fy": half_force[1], "fz": half_force[2],
+                    "mx": 0, "my": 0, "mz": 0,
+                })
+            uniform_load_applied = True
+
+        elif application_type == "uniform-area":
+            if load_case["elementId"] not in shell_source_ids:
+                warnings.append(
+                    f"⚠️ Uniform Area Load এর element '{load_case['elementId']}' একটা shell "
+                    f"(Slab/Wall) না — বাদ দেওয়া হয়েছে।"
+                )
+                continue
+
+            quads = shell_meshes.get(load_case["elementId"], [])
+            if not quads:
+                warnings.append(
+                    f"⚠️ Uniform Area Load এর element '{load_case['elementId']}' এর কোনো mesh quad "
+                    f"পাওয়া যায়নি (mesh generation ব্যর্থ হয়ে থাকতে পারে) — এই লোড প্রয়োগ করা যায়নি।"
+                )
+                continue
+
+            # intensity সবসময় gravity (global -Y) দিক ধরা হয় (frontend এর
+            # UniformAreaLoadCase এ শুধু "intensity" (kN/m²) থাকে, কোনো
+            # axis component না — module-data.ts এর কমেন্ট "সাধারণত gravity
+            # load" নিশ্চিত করে)। প্রতিটা quad এর area × intensity ÷ 4 করে
+            # তার ৪টা corner node এ সমানভাবে lump করা হয় (consistent load
+            # না, কিন্তু uniform pressure এর জন্য uniform mesh এ ভালো
+            # approximation)।
+            intensity_kn_m2 = load_case.get("intensity", 0.0)
+            for quad in quads:
+                quad_area = _quad_area_3d(quad)
+                quad_total_force = intensity_kn_m2 * quad_area
+                force_per_corner = quad_total_force / 4.0
+
+                for corner in quad:
+                    node_idx = point_index(corner)
+                    solver_loads.append({
+                        "nodeIndex": node_idx,
+                        "fx": 0.0, "fy": force_per_corner, "fz": 0.0,
+                        "mx": 0, "my": 0, "mz": 0,
+                    })
+            uniform_load_applied = True
+
         else:
-            point = _interpolate_point(target_element["startPoint"], target_element["endPoint"], ratio)
-
-        node_idx = point_index(point)
-
-        solver_loads.append({
-            "nodeIndex": node_idx,
-            "fx": load_case["forceX"], "fy": load_case["forceY"], "fz": load_case["forceZ"],
-            "mx": 0, "my": 0, "mz": 0,
-        })
+            unsupported_load_types.add(application_type)
 
     if unsupported_load_types:
         warnings.append(
             f"⚠️ এই লোড টাইপ গুলো এই Phase এ সমর্থিত না, বাদ দেওয়া হয়েছে: "
-            f"{', '.join(sorted(unsupported_load_types))} (শুধু Point Load বর্তমানে ব্যবহারযোগ্য)।"
+            f"{', '.join(sorted(unsupported_load_types))}।"
+        )
+
+    if uniform_load_applied:
+        warnings.append(
+            "ℹ️ Uniform Line/Area Load কে equivalent nodal load এ রূপান্তর করা হয়েছে "
+            "(simply-supported lumped approximation, exact fixed-end-moment consistent load না) — "
+            "তাই এই লোড থেকে আসা reaction/displacement মোটামুটি নির্ভুল কিন্তু sub-element "
+            "internal force diagram এ (span এর মাঝামাঝি) সামান্য পার্থক্য থাকতে পারে প্রকৃত "
+            "distributed-load internal force curve এর তুলনায়। Uniform Area Load এর ক্ষেত্রে "
+            "shell element এ এখনো internal force/moment recovery নেই (শুধু displacement solve "
+            "হয়), তাই সেই লোড থেকে stress/moment ফলাফল পাওয়া যাবে না।"
         )
 
     if not solver_loads and not solver_shell_elements:
-        warnings.append("⚠️ কোনো ব্যবহারযোগ্য (Point) load পাওয়া যায়নি — সলভার শূন্য-লোড অবস্থায় চলবে।")
+        warnings.append("⚠️ কোনো ব্যবহারযোগ্য load পাওয়া যায়নি — সলভার শূন্য-লোড অবস্থায় চলবে।")
     elif not solver_loads and solver_shell_elements:
-        warnings.append(
-            "ℹ️ কোনো Point Load নেই — শুধু shell (Slab/Wall) geometry/stiffness solve হয়েছে "
-            "(shell এ load application এখনো সমর্থিত না, উপরে দেখুন)।"
-        )
+        warnings.append("ℹ️ কোনো load প্রয়োগযোগ্য পাওয়া যায়নি — শুধু shell (Slab/Wall) geometry/stiffness solve হয়েছে।")
 
     solver_input = {
         "nodes": node_list,
