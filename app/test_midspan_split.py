@@ -14,9 +14,20 @@ orchestration logic (split হওয়া node/element/load সঠিক কি
 numerical solver accuracy না (সেটা cpp/tests/ এর দায়িত্ব)।
 """
 
+import os
 import sys
 
-from analysis_orchestration import build_solver_model, ModelParsingError
+# app/ থেকে সরাসরি (python3 test_midspan_split.py) চালালে project root
+# sys.path এ থাকে না, তাই analysis_orchestration.py এর নিজস্ব "from
+# app.model_conversion import ..." (package-style, production convention —
+# app/main.py এর সাথে সামঞ্জস্যপূর্ণ) resolve করতে ব্যর্থ হয়। এই দুই লাইন
+# project root (app/ এর parent) কে path এ যোগ করে, যাতে "app" প্যাকেজ
+# হিসেবে import করা যায় — bare "from analysis_orchestration import ..."
+# এর বদলে, যেটা কখনো কাজ করত না (analysis_orchestration.py নিজেই
+# "app." prefix আশা করে)।
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app.analysis_orchestration import build_solver_model, ModelParsingError
 
 testsPassed = 0
 testsFailed = 0
@@ -30,6 +41,12 @@ def check(name: str, condition: bool) -> None:
     else:
         print(f"  [FAIL] {name}")
         testsFailed += 1
+        # pytest collection এর সময় module-level কোড import হিসেবে চলে —
+        # raised AssertionError ছাড়া pytest বুঝতে পারবে না কিছু fail
+        # করেছে (নিচের check() কল গুলো শুধু print/counter, exception না)।
+        # standalone চালানোর output/exit code অপরিবর্তিত থাকে (নিচের
+        # __main__ guard দেখুন)।
+        raise AssertionError(f"check failed: {name}")
 
 
 def make_basic_beam(connection_type: str = "moment") -> tuple[list, list, list]:
@@ -132,4 +149,9 @@ print(f"\n{'=' * 40}")
 print(f"Results: {testsPassed} passed, {testsFailed} failed")
 print("=" * 40)
 
-sys.exit(1 if testsFailed > 0 else 0)
+# __main__ guard: pytest এই ফাইল import করলে sys.exit() রেজ হয়ে
+# INTERNALERROR দিত (pytest নিজের exit flow না এমন SystemExit ক্র্যাশ
+# হিসেবে ধরে) — standalone চালানোর (python3 test_midspan_split.py)
+# সময়ই শুধু এই কল সক্রিয়।
+if __name__ == "__main__":
+    sys.exit(1 if testsFailed > 0 else 0)

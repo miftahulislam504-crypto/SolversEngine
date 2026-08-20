@@ -4,7 +4,16 @@ test_mesh_generation.py — mesh_generation.py এর জন্য unit test।
 """
 
 import math
+import os
 import sys
+
+# app/ থেকে সরাসরি (python3 test_mesh_generation.py) চালালে কাজ করে
+# (app/ নিজেই sys.path এ থাকে), কিন্তু pytest root থেকে চালালে "app"
+# একটা package হিসেবে treat হয় ও app/ ভিতরের bare import
+# ("mesh_generation" মডিউল top-level এ খোঁজে) ব্যর্থ হয়। এই লাইন app/
+# কে নিজেই path এ যোগ করে (idempotent — আগে থেকে থাকলে কিছু বদলায় না),
+# যাতে দুই সময়েই (standalone ও pytest) bare import কাজ করে।
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mesh_generation import generate_quad_mesh, MeshGenerationError
 
@@ -20,6 +29,15 @@ def check(name: str, condition: bool) -> None:
     else:
         print(f"  [FAIL] {name}")
         testsFailed += 1
+        # pytest এই ফাইল collect করলে (module-level কোড import-time এ
+        # চলে) একটা raised AssertionError ছাড়া pytest বুঝতেই পারবে না
+        # যে কিছু fail করেছে — নিচের সব check() শুধু print/counter,
+        # exception না। AssertionError raise করাটাই সবচেয়ে ছোট, নিরাপদ
+        # fix: standalone চালানোর সময় (python3 test_mesh_generation.py)
+        # print output ও exit code অপরিবর্তিত থাকে (নিচের __main__ guard
+        # দেখুন), কিন্তু pytest চালালে এখন সঠিকভাবে ফেইল রিপোর্ট হয়,
+        # module import silently সফল হওয়ার বদলে।
+        raise AssertionError(f"check failed: {name}")
 
 
 def quad_area_3d(q: list[tuple[float, float, float]]) -> float:
@@ -136,4 +154,13 @@ print(f"\n{'=' * 40}")
 print(f"Results: {testsPassed} passed, {testsFailed} failed")
 print("=" * 40)
 
-sys.exit(1 if testsFailed > 0 else 0)
+# ⚠️ ফিক্স: আগে এই sys.exit() unconditionally module-level এ চলত —
+# pytest এই ফাইল import/collect করলে SystemExit রেজ হয়ে
+# "INTERNALERROR" দিত (pytest নিজেই sys.exit(0) কে ক্র্যাশ হিসেবে ধরে,
+# কারণ এটা pytest এর নিজের exit flow না)। __name__ == "__main__" guard
+# দিয়ে এই কল শুধু "python3 test_mesh_generation.py" (standalone) চালানোর
+# সময় সক্রিয় থাকে — pytest import করলে সম্পূর্ণ স্কিপ হয়ে যায়, কারণ
+# ততক্ষণে check()-এর AssertionError (উপরে) ইতিমধ্যে ঠিকভাবে pytest কে
+# ফেইল জানিয়ে দিয়েছে।
+if __name__ == "__main__":
+    sys.exit(1 if testsFailed > 0 else 0)

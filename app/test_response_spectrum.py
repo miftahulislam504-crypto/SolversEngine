@@ -3,6 +3,16 @@ test_response_spectrum.py — response_spectrum.py এর জন্য unit test
 চালানো: python3 test_response_spectrum.py
 """
 
+import os
+import sys
+
+# app/ থেকে সরাসরি চালালে কাজ করে (app/ নিজেই sys.path এ থাকে), কিন্তু
+# pytest root থেকে চালালে "app" একটা package হিসেবে treat হয় ও app/
+# ভিতরের bare import ("response_spectrum" মডিউল top-level এ খোঁজে)
+# ব্যর্থ হয়। এই লাইন app/ কে নিজেই path এ যোগ করে (idempotent), যাতে
+# দুই সময়েই (standalone ও pytest) bare import কাজ করে।
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from response_spectrum import build_bnbc_2020_spectrum, get_zone_ss_s1
 
 testsPassed = 0
@@ -17,6 +27,12 @@ def check(name: str, condition: bool) -> None:
     else:
         print(f"  [FAIL] {name}")
         testsFailed += 1
+        # pytest collection এর সময় module-level কোড import হিসেবে চলে —
+        # raised AssertionError ছাড়া pytest বুঝতে পারবে না কিছু fail
+        # করেছে (check()/check_close() শুধু print/counter, exception না)।
+        # standalone চালানোর output/exit code অপরিবর্তিত থাকে (নিচের
+        # __main__ guard দেখুন)।
+        raise AssertionError(f"check failed: {name}")
 
 
 def check_close(name: str, actual: float, expected: float, tol: float) -> None:
@@ -29,6 +45,7 @@ def check_close(name: str, actual: float, expected: float, tol: float) -> None:
         print(f"  [FAIL] {name} = {actual:.6f} (expected {expected:.6f}, rel error = {rel_error:.6f})")
         global testsFailed
         testsFailed += 1
+        raise AssertionError(f"check_close failed: {name} (actual={actual}, expected={expected})")
 
 
 print("=== Test 1: Spectrum Shape — Rise, Plateau, Decay ===")
@@ -95,5 +112,10 @@ print("\n========================================")
 print(f"Results: {testsPassed} passed, {testsFailed} failed")
 print("========================================")
 
-import sys
-sys.exit(1 if testsFailed > 0 else 0)
+# __main__ guard: pytest এই ফাইল import করলে sys.exit() রেজ হয়ে
+# INTERNALERROR দিত (pytest নিজের exit flow না এমন SystemExit ক্র্যাশ
+# হিসেবে ধরে) — standalone চালানোর (python3 test_response_spectrum.py)
+# সময়ই শুধু এই কল সক্রিয়।
+if __name__ == "__main__":
+    import sys
+    sys.exit(1 if testsFailed > 0 else 0)
