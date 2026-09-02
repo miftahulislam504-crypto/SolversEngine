@@ -219,6 +219,21 @@ def build_solver_model(
     """
     warnings: list[str] = []
 
+    # ইনপুট validation: প্রতিটা element-এ 'category' ও 'elementId' key
+    # থাকতেই হবে — নিচের পুরো ফাংশন জুড়ে এই দুটো key ধরে নিয়েই কাজ করা
+    # হয়। এই আপফ্রন্ট চেক না থাকলে malformed/incomplete element (যেমন
+    # কোনো diagnostic/placeholder payload, বা future client bug) সরাসরি
+    # raw KeyError তুলে পুরো সার্ভিসকে unhandled 500 crash করাত। এখন এর
+    # বদলে একটা readable ModelParsingError ওঠে, যা main.py 422 এ ম্যাপ
+    # করে দেয়।
+    for idx, e in enumerate(elements):
+        missing = [k for k in ("elementId", "category") if k not in e]
+        if missing:
+            raise ModelParsingError(
+                f"elements[{idx}] এ আবশ্যক key অনুপস্থিত: {', '.join(missing)}। "
+                f"প্রতিটা element এ কমপক্ষে 'elementId' ও 'category' থাকতে হবে।"
+            )
+
     skipped_elements = [e for e in elements if e["category"] in UNSUPPORTED_ELEMENT_CATEGORIES]
     if skipped_elements:
         categories = sorted({e["category"] for e in skipped_elements})
